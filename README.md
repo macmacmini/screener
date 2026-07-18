@@ -27,6 +27,18 @@ Monitors Real World Asset markets (stocks, commodities, forex) using Hyperliquid
 python price_screener_rwa.py
 ```
 
+### 3. QFEX Screener (`price_screener_qfex.py`)
+Monitors QFEX perpetual markets (stocks, commodities, forex, indices) via public websocket.
+
+- Monitors all ~138 QFEX markets (NVDA, TSLA, GOLD, EUR-USD, US500, etc.)
+- Compares executed trade prices vs QFEX's own underlier (oracle) price
+- Underlier source shown in alerts: `external` (market hours) / `internal` (order-book derived, off hours)
+- Websocket feed (wss://mds.qfex.com), no API key needed; stale prices are skipped
+
+```bash
+python price_screener_qfex.py
+```
+
 ## Setup
 
 ### 1. Install Dependencies
@@ -85,6 +97,7 @@ All settings except Telegram credentials:
 
 - `price_screener_binance.py` - Crypto screener (Lighter + Hyperliquid vs Binance)
 - `price_screener_rwa.py` - RWA screener (stocks, commodities, forex)
+- `price_screener_qfex.py` - QFEX screener (trades vs underlier price)
 - `config.json` - Blacklist and custom thresholds
 - `requirements.txt` - Python dependencies
 - `.env` - Environment configuration
