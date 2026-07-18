@@ -1,6 +1,7 @@
 """
-Multi-Exchange Price Screener with Binance Mark Price
-Compares Lighter.xyz and Hyperliquid prices against Binance Futures mark prices
+Crypto Price Screener
+Compares Lighter.xyz last trade prices against Lighter's own index price
+and Hyperliquid bid/ask against Hyperliquid's own oracle price
 Alerts when significant deviations are detected
 """
 
@@ -48,9 +49,13 @@ CONFIG = load_config()
 SYMBOL_BLACKLIST = set(CONFIG.get('symbol_blacklist', []))
 CUSTOM_THRESHOLDS = CONFIG.get('custom_thresholds', {})
 
+# Lighter strategy_index for crypto markets
+# (3-7 = RWA markets, covered by the RWA screener; 0 = inactive/delisted)
+CRYPTO_STRATEGY_INDEX = 2
 
-class BinancePriceScreener:
-    """Monitor Lighter.xyz and Hyperliquid markets against Binance mark prices"""
+
+class CryptoPriceScreener:
+    """Monitor crypto markets: Lighter vs its own index price, Hyperliquid vs its own oracle"""
 
     def __init__(self):
         self.deviation_threshold = float(CONFIG.get('default_threshold', 0.5))
@@ -83,164 +88,57 @@ class BinancePriceScreener:
         self.client = lighter.ApiClient()
         self.order_api = lighter.OrderApi(self.client)
 
-        # Market data cache
-        self.lighter_markets: Dict[int, dict] = {}
-        self.binance_prices: Dict[str, float] = {}
-
-        # Mapping of Lighter market IDs to Binance symbols
-        # We'll populate this dynamically by matching symbols
-        self.market_to_binance: Dict[int, str] = {}
-
         # Symbol -> market_id mapping for recent_trades validation
         self.symbol_to_market_id: Dict[str, int] = {}
 
-    def get_binance_symbol(self, lighter_symbol: str) -> Optional[str]:
-        """Convert Lighter symbol to Binance futures symbol"""
-        # Lighter symbols are like "BTC", "ETH", "SOL", "AAVE", etc.
-        # Binance futures symbols are like "BTCUSDT", "ETHUSDT", "SOLUSDT", "AAVEUSDT"
-
-        if not lighter_symbol:
-            return None
-
-        # Clean up the symbol and convert to uppercase
-        base = lighter_symbol.strip().upper()
-
-        # Skip symbols that are obviously not standard crypto pairs
-        # (too long, or known non-standard ones)
-        if len(base) > 10 or not base:
-            return None
-
-        # Map to Binance futures symbol
-        binance_symbol = f"{base}USDT"
-
-        return binance_symbol
-
-    async def fetch_binance_mark_prices(self) -> Dict[str, float]:
-        """Fetch mark prices from Binance Futures"""
+    async def fetch_all_lighter_prices(self) -> Dict[str, dict]:
+        """Fetch all crypto markets from Lighter in one bulk call.
+        order_book_details includes Lighter's own index_price (oracle),
+        so each market carries its own reference price."""
         try:
-            response = requests.get(
-                "https://fapi.binance.com/fapi/v1/premiumIndex",
-                timeout=10
-            )
-            response.raise_for_status()
+            details = await self.order_api.order_book_details()
 
-            data = response.json()
-
-            prices = {}
-            for item in data:
-                symbol = item.get('symbol')
-                mark_price = item.get('markPrice')
-
-                if symbol and mark_price:
-                    try:
-                        prices[symbol] = float(mark_price)
-                    except (ValueError, TypeError):
-                        continue
-
-            logger.info(f"Fetched {len(prices)} mark prices from Binance")
-            return prices
-
-        except Exception as e:
-            logger.error(f"Error fetching Binance prices: {e}")
-            return {}
-
-    async def fetch_lighter_markets(self):
-        """Fetch all available Lighter markets"""
-        try:
-            orderbooks_response = await self.order_api.order_books()
-
-            # Handle the OrderBooks object
-            if hasattr(orderbooks_response, 'data'):
-                orderbooks = orderbooks_response.data
-            elif hasattr(orderbooks_response, 'order_books'):
-                orderbooks = orderbooks_response.order_books
-            elif hasattr(orderbooks_response, '__dict__'):
-                orderbooks = list(orderbooks_response.__dict__.values())[0] if orderbooks_response.__dict__ else []
+            if hasattr(details, 'order_book_details'):
+                order_book_details = details.order_book_details
             else:
-                orderbooks = orderbooks_response
-
-            if isinstance(orderbooks, list):
-                for orderbook in orderbooks:
-                    # Extract market_id and symbol
-                    if isinstance(orderbook, dict):
-                        market_id = orderbook.get('market_id') or orderbook.get('order_book_id') or orderbook.get('id')
-                        symbol = orderbook.get('symbol', '')
-                    else:
-                        market_id = getattr(orderbook, 'market_id', None) or getattr(orderbook, 'order_book_id', None) or getattr(orderbook, 'id', None)
-                        symbol = getattr(orderbook, 'symbol', '')
-
-                    if market_id is not None:
-                        market_id = int(market_id)
-                        self.lighter_markets[market_id] = {
-                            'symbol': symbol,
-                            'data': orderbook
-                        }
-
-                        # Try to map to Binance symbol
-                        binance_symbol = self.get_binance_symbol(symbol)
-                        if binance_symbol:
-                            self.market_to_binance[market_id] = binance_symbol
-
-            logger.info(f"Fetched {len(self.lighter_markets)} Lighter markets")
-
-            # Log first few Lighter symbols to debug
-            for i, (market_id, info) in enumerate(list(self.lighter_markets.items())[:10]):
-                symbol = info['symbol']
-                logger.info(f"  Sample Lighter symbol: '{symbol}' (ID:{market_id})")
-
-            logger.info(f"Mapped {len(self.market_to_binance)} markets to Binance symbols")
-
-            # Log first few mappings for verification
-            if self.market_to_binance:
-                for i, (market_id, binance_sym) in enumerate(list(self.market_to_binance.items())[:5]):
-                    lighter_sym = self.lighter_markets[market_id]['symbol']
-                    logger.info(f"  Mapping: {lighter_sym} (ID:{market_id}) -> {binance_sym}")
-            else:
-                logger.warning("No markets were mapped! Check symbol format.")
-
-            return self.lighter_markets
-
-        except Exception as e:
-            logger.error(f"Error fetching Lighter markets: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            return {}
-
-    async def fetch_all_lighter_prices(self) -> Dict[str, float]:
-        """Fetch last trade prices for ALL markets using bulk endpoint"""
-        try:
-            stats_response = await self.order_api.exchange_stats()
+                order_book_details = []
 
             prices = {}
 
-            # Parse the response
-            if hasattr(stats_response, 'order_book_stats'):
-                order_book_stats = stats_response.order_book_stats
-            elif isinstance(stats_response, dict):
-                order_book_stats = stats_response.get('order_book_stats', [])
-            else:
-                logger.warning(f"Unexpected stats response type: {type(stats_response)}")
-                return {}
-
-            # Extract last_trade_price for each market
-            for stat in order_book_stats:
-                if isinstance(stat, dict):
-                    symbol = stat.get('symbol')
-                    last_price = stat.get('last_trade_price')
-                    trades_count = stat.get('daily_trades_count', 0)
+            for detail in order_book_details:
+                if isinstance(detail, dict):
+                    d = detail
                 else:
-                    symbol = getattr(stat, 'symbol', None)
-                    last_price = getattr(stat, 'last_trade_price', None)
-                    trades_count = getattr(stat, 'daily_trades_count', 0)
+                    d = detail.to_dict()
 
-                if symbol and last_price and last_price > 0:
-                    # Store with symbol as key (easier to match later)
-                    prices[symbol] = {
-                        'last_trade_price': float(last_price),
-                        'trades_count': trades_count
-                    }
+                if d.get('status') != 'active':
+                    continue
+                if d.get('strategy_index') != CRYPTO_STRATEGY_INDEX:
+                    continue
 
-            logger.info(f"Fetched prices for {len(prices)} Lighter markets (bulk)")
+                symbol = d.get('symbol')
+                last_price = d.get('last_trade_price')
+                index_price = d.get('index_price')
+
+                if not symbol or not last_price or not index_price:
+                    continue
+
+                try:
+                    last_price = float(last_price)
+                    index_price = float(index_price)
+                except (ValueError, TypeError):
+                    continue
+
+                if last_price <= 0 or index_price <= 0:
+                    continue
+
+                prices[symbol] = {
+                    'last_trade_price': last_price,
+                    'index_price': index_price,
+                    'trades_count': d.get('daily_trades_count', 0)
+                }
+
+            logger.info(f"Fetched prices for {len(prices)} Lighter crypto markets (bulk)")
             return prices
 
         except Exception as e:
@@ -315,16 +213,17 @@ class BinancePriceScreener:
                 symbol = market.get('name')
                 ctx = contexts[i]
 
-                # Extract bid/ask from impactPxs
+                # Extract bid/ask from impactPxs and Hyperliquid's own oracle price
                 impact_pxs = ctx.get('impactPxs')
                 mid_px = ctx.get('midPx')
+                oracle_px = ctx.get('oraclePx')
                 day_volume = ctx.get('dayNtlVlm')  # Daily notional volume in USD
 
                 if not symbol or not impact_pxs or len(impact_pxs) != 2:
                     continue
 
-                # Skip if no mid price (market might be inactive)
-                if mid_px is None:
+                # Skip if no mid price (market might be inactive) or no oracle price
+                if mid_px is None or oracle_px is None:
                     continue
 
                 # Skip markets with low volume (< $150k in 24h)
@@ -338,6 +237,7 @@ class BinancePriceScreener:
                         'best_bid': float(impact_pxs[0]),
                         'best_ask': float(impact_pxs[1]),
                         'mid_price': float(mid_px),
+                        'oracle_price': float(oracle_px),
                         'volume_24h': volume_usd
                     }
                 except (ValueError, TypeError):
@@ -352,11 +252,11 @@ class BinancePriceScreener:
             logger.error(traceback.format_exc())
             return {}
 
-    def calculate_deviation(self, lighter_price: float, binance_price: float) -> float:
-        """Calculate percentage deviation"""
-        if binance_price == 0:
+    def calculate_deviation(self, price: float, reference_price: float) -> float:
+        """Calculate percentage deviation from reference (index/oracle) price"""
+        if reference_price == 0:
             return 0.0
-        return ((lighter_price - binance_price) / binance_price) * 100
+        return ((price - reference_price) / reference_price) * 100
 
     async def send_alert(self, market_id: int, message: str):
         """Send alert via Telegram and/or console"""
@@ -429,42 +329,30 @@ class BinancePriceScreener:
             except TelegramError as e:
                 logger.error(f"Failed to send Telegram message: {e}")
 
-    def check_market(self, symbol: str, lighter_data: dict, binance_symbol: str):
-        """Check a single market for price deviation (synchronous)"""
+    def check_market(self, symbol: str, lighter_data: dict):
+        """Check a single Lighter market: last trade price vs Lighter's own index price"""
         try:
             # Skip blacklisted symbols
             if symbol in SYMBOL_BLACKLIST:
                 logger.debug(f"Skipping {symbol}: in blacklist")
                 return None
 
-            # Get Binance mark price
-            binance_price = self.binance_prices.get(binance_symbol)
-            if not binance_price:
-                logger.debug(f"No Binance price for {binance_symbol}")
-                return None
-
-            # Get Lighter price from pre-fetched data
             lighter_price = lighter_data.get('last_trade_price')
-            if not lighter_price:
-                logger.debug(f"No Lighter price for {symbol}")
+            index_price = lighter_data.get('index_price')
+            if not lighter_price or not index_price:
+                logger.debug(f"No Lighter price/index for {symbol}")
                 return None
 
             # Calculate deviation
-            deviation = self.calculate_deviation(lighter_price, binance_price)
+            deviation = self.calculate_deviation(lighter_price, index_price)
 
             logger.debug(
-                f"{symbol}: Lighter=${lighter_price:.4f}, Binance=${binance_price:.4f}, "
+                f"{symbol}: Lighter=${lighter_price:.4f}, Index=${index_price:.4f}, "
                 f"Deviation={deviation:.2f}%"
             )
 
             # Get threshold (custom or default)
             threshold = CUSTOM_THRESHOLDS.get(symbol, self.deviation_threshold)
-
-            # Skip if deviation is too large (likely different tokens)
-            # But skip this check for symbols with custom thresholds
-            if symbol not in CUSTOM_THRESHOLDS and abs(deviation) > 30:
-                logger.debug(f"Skipping {symbol}: deviation {deviation:.2f}% exceeds 30% (likely symbol mismatch)")
-                return None
 
             # Alert if deviation exceeds threshold
             if abs(deviation) >= threshold:
@@ -474,8 +362,8 @@ class BinancePriceScreener:
                 message = (
                     f"{emoji} *TRADE OPPORTUNITY*\n"
                     f"*{symbol}* @ Lighter\n"
-                    f"Last Trade: `${lighter_price:.2f}`\n"
-                    f"Mark Price: `${binance_price:.2f}`\n"
+                    f"Last Trade: `${lighter_price:.4f}`\n"
+                    f"Index: `${index_price:.4f}`\n"
                     f"Deviation: *{direction}{abs(deviation):.2f}%*\n"
                     f"🔗 https://app.lighter.xyz/trade/{symbol}"
                 )
@@ -487,46 +375,34 @@ class BinancePriceScreener:
             logger.error(f"Error checking market {symbol}: {e}")
             return None
 
-    def check_hyperliquid_market(self, symbol: str, hl_data: dict, binance_symbol: str):
-        """Check a single Hyperliquid market for bid/ask deviation (synchronous)"""
+    def check_hyperliquid_market(self, symbol: str, hl_data: dict):
+        """Check a single Hyperliquid market: bid/ask vs Hyperliquid's own oracle price"""
         try:
             # Skip blacklisted symbols
             if symbol in SYMBOL_BLACKLIST:
                 logger.debug(f"Skipping {symbol}: in blacklist")
                 return None
 
-            # Get Binance mark price
-            binance_price = self.binance_prices.get(binance_symbol)
-            if not binance_price:
-                logger.debug(f"No Binance price for {binance_symbol}")
-                return None
-
-            # Get Hyperliquid bid/ask from pre-fetched data
+            oracle_price = hl_data.get('oracle_price')
             best_bid = hl_data.get('best_bid')
             best_ask = hl_data.get('best_ask')
 
-            if not best_bid or not best_ask:
-                logger.debug(f"No Hyperliquid bid/ask for {symbol}")
+            if not oracle_price or not best_bid or not best_ask:
+                logger.debug(f"No Hyperliquid bid/ask/oracle for {symbol}")
                 return None
 
-            # Calculate deviations for bid and ask separately
-            bid_deviation = self.calculate_deviation(best_bid, binance_price)
-            ask_deviation = self.calculate_deviation(best_ask, binance_price)
+            # Calculate deviations from Hyperliquid's own oracle
+            bid_deviation = self.calculate_deviation(best_bid, oracle_price)
+            ask_deviation = self.calculate_deviation(best_ask, oracle_price)
 
             logger.debug(
                 f"{symbol}: Bid=${best_bid:.4f} ({bid_deviation:.2f}%), "
                 f"Ask=${best_ask:.4f} ({ask_deviation:.2f}%), "
-                f"Binance=${binance_price:.4f}"
+                f"Oracle=${oracle_price:.4f}"
             )
 
             # Get threshold (custom or default)
             threshold = CUSTOM_THRESHOLDS.get(symbol, self.deviation_threshold)
-
-            # Skip if either deviation is too large (likely different tokens)
-            # But skip this check for symbols with custom thresholds
-            if symbol not in CUSTOM_THRESHOLDS and (abs(bid_deviation) > 30 or abs(ask_deviation) > 30):
-                logger.debug(f"Skipping {symbol}: deviation exceeds 30% (likely symbol mismatch)")
-                return None
 
             # Check if either bid or ask deviates beyond threshold
             alerts = []
@@ -537,8 +413,8 @@ class BinancePriceScreener:
                 message = (
                     f"{emoji} *SELL OPPORTUNITY*\n"
                     f"*{symbol}* @ Hyperliquid\n"
-                    f"Best Bid: `${best_bid:.2f}`\n"
-                    f"Mark Price: `${binance_price:.2f}`\n"
+                    f"Best Bid: `${best_bid:.4f}`\n"
+                    f"Oracle: `${oracle_price:.4f}`\n"
                     f"Deviation: *{direction}{abs(bid_deviation):.2f}%*\n"
                     f"🔗 https://app.hyperliquid.xyz/trade/{symbol}"
                 )
@@ -550,8 +426,8 @@ class BinancePriceScreener:
                 message = (
                     f"{emoji} *BUY OPPORTUNITY*\n"
                     f"*{symbol}* @ Hyperliquid\n"
-                    f"Best Ask: `${best_ask:.2f}`\n"
-                    f"Mark Price: `${binance_price:.2f}`\n"
+                    f"Best Ask: `${best_ask:.4f}`\n"
+                    f"Oracle: `${oracle_price:.4f}`\n"
                     f"Deviation: *{direction}{abs(ask_deviation):.2f}%*\n"
                     f"🔗 https://app.hyperliquid.xyz/trade/{symbol}"
                 )
@@ -564,18 +440,11 @@ class BinancePriceScreener:
             return None
 
     async def scan_all_markets(self):
-        """Scan all markets for price deviations"""
-        # Refresh Binance prices (1 API call)
-        self.binance_prices = await self.fetch_binance_mark_prices()
-
-        if not self.binance_prices:
-            logger.warning("No Binance prices available, skipping scan")
-            return
-
-        # Fetch ALL Lighter prices in ONE call
+        """Scan all markets: Lighter vs its own index price, Hyperliquid vs its own oracle"""
+        # Fetch ALL Lighter prices in ONE call (includes Lighter's own index price)
         lighter_prices = await self.fetch_all_lighter_prices()
 
-        # Fetch ALL Hyperliquid prices in ONE call
+        # Fetch ALL Hyperliquid prices in ONE call (includes Hyperliquid's own oracle)
         hyperliquid_prices = await self.fetch_hyperliquid_prices()
 
         if not lighter_prices and not hyperliquid_prices:
@@ -587,35 +456,15 @@ class BinancePriceScreener:
         # Check markets synchronously (data already fetched)
         alerts = []
 
-        # Check Lighter markets
+        # Check Lighter markets against Lighter's own index price
         for symbol, lighter_data in lighter_prices.items():
-            # Map Lighter symbol to Binance symbol
-            binance_symbol = self.get_binance_symbol(symbol)
-            if not binance_symbol:
-                continue
-
-            # Skip if Binance doesn't have this symbol
-            if binance_symbol not in self.binance_prices:
-                continue
-
-            # Check for deviation
-            result = self.check_market(symbol, lighter_data, binance_symbol)
+            result = self.check_market(symbol, lighter_data)
             if result:
                 alerts.append(result)
 
-        # Check Hyperliquid markets
+        # Check Hyperliquid markets against Hyperliquid's own oracle
         for symbol, hl_data in hyperliquid_prices.items():
-            # Map Hyperliquid symbol to Binance symbol
-            binance_symbol = self.get_binance_symbol(symbol)
-            if not binance_symbol:
-                continue
-
-            # Skip if Binance doesn't have this symbol
-            if binance_symbol not in self.binance_prices:
-                continue
-
-            # Check for deviation (returns list of alerts or None)
-            result = self.check_hyperliquid_market(symbol, hl_data, binance_symbol)
+            result = self.check_hyperliquid_market(symbol, hl_data)
             if result:
                 # Result is a list of alerts (bid and/or ask)
                 alerts.extend(result)
@@ -681,8 +530,9 @@ class BinancePriceScreener:
 
     async def run(self):
         """Main loop - continuously monitor markets"""
-        logger.info(f"Starting Multi-Exchange Price Screener (Optimized)")
-        logger.info(f"Monitoring: Lighter.xyz + Hyperliquid vs Binance")
+        logger.info(f"Starting Crypto Price Screener")
+        logger.info(f"Monitoring: Lighter.xyz + Hyperliquid")
+        logger.info(f"Reference: Lighter index price / Hyperliquid oracle (each vs its own)")
         logger.info(f"Deviation threshold: {self.deviation_threshold}%")
         logger.info(f"Poll interval: {self.poll_interval} seconds")
 
@@ -714,7 +564,7 @@ class BinancePriceScreener:
 
 async def main():
     """Entry point"""
-    screener = BinancePriceScreener()
+    screener = CryptoPriceScreener()
     try:
         await screener.run()
     finally:

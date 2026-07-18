@@ -4,30 +4,24 @@ Real-time price monitoring tool that compares prices across exchanges and alerts
 
 ## Screeners
 
-### 1. Crypto Screener (`price_screener_binance.py`)
-Monitors cryptocurrency markets on Lighter.xyz and Hyperliquid against Binance Futures mark prices.
+### 1. Unified Screener (`price_screener.py`)
+Monitors ALL Lighter.xyz and Hyperliquid markets (crypto + RWA) in one process.
+Each exchange is compared against its own index/oracle price - no cross-exchange
+symbol mapping needed.
 
-- Compares Lighter last trade prices vs Binance mark prices
-- Compares Hyperliquid bid/ask vs Binance mark prices
-- Uses bulk API endpoints (only 3 API calls per scan)
-- Auto-blacklisting for markets with repeated alerts
-
-```bash
-python price_screener_binance.py
-```
-
-### 2. RWA Screener (`price_screener_rwa.py`)
-Monitors Real World Asset markets (stocks, commodities, forex) using Hyperliquid oracle prices.
-
-- Monitors: TSLA, AAPL, GOOGL, NVDA, XAU, EURUSD, etc.
-- Compares Lighter prices vs Hyperliquid oracle
-- Compares Hyperliquid xyz bid/ask vs oracle
+- Lighter: last trade vs Lighter's own index price (~185 markets, 1 bulk call)
+- Hyperliquid main dex: bid/ask vs own oracle (~127 crypto markets, 1 call)
+- Hyperliquid xyz dex: bid/ask vs own oracle (~86 RWA markets, 1 call)
+- 3 API calls per scan, auto-blacklisting, 2-poll confirmation
 
 ```bash
-python price_screener_rwa.py
+python price_screener.py
 ```
 
-### 3. QFEX Screener (`price_screener_qfex.py`)
+Replaces the legacy `price_screener_binance.py` and `price_screener_rwa.py`
+(kept in the repo for reference until the unified screener is proven in use).
+
+### 2. QFEX Screener (`price_screener_qfex.py`)
 Monitors QFEX perpetual markets (stocks, commodities, forex, indices) via public websocket.
 
 - Monitors all ~138 QFEX markets (NVDA, TSLA, GOLD, EUR-USD, US500, etc.)
@@ -77,7 +71,10 @@ All settings except Telegram credentials:
 ```json
 {
   "default_threshold": 4.0,
-  "poll_interval": 1,
+  "poll_interval": 3,
+  "poll_interval_lighter": 1.5,
+  "poll_interval_hyperliquid": 2.5,
+  "poll_interval_qfex": 1,
   "symbol_blacklist": ["SYMBOL1", "SYMBOL2"],
   "custom_thresholds": {
     "BTC": 0.3,
@@ -89,15 +86,20 @@ All settings except Telegram credentials:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `default_threshold` | 4.0 | Alert threshold percentage |
-| `poll_interval` | 1 | Seconds between scans |
+| `poll_interval_lighter` | 1.5 | Seconds between Lighter scans. Limit: 60 req/min per IP; 1.5s = 40/min (67%), leaving headroom for recent_trades validation calls |
+| `poll_interval_hyperliquid` | 2.5 | Seconds between Hyperliquid scans (main + xyz = 2 calls x 20 weight). Limit: 1200 weight/min per IP; 2.5s = 960/min (80%) |
+| `poll_interval_qfex` | 1 | Seconds between QFEX scans (websocket-fed, no REST calls, safe to keep at 1) |
+| `poll_interval` | 3 | Fallback for the above + used by the legacy screeners |
+| `min_volume_lighter` | 10000 | Minimum 24h USD volume for Lighter markets; filters out dead markets whose stale last trade sits far from index (Hyperliquid equivalents are hardcoded: 150k main / 50k xyz) |
 | `symbol_blacklist` | [] | Symbols to ignore |
 | `custom_thresholds` | {} | Per-symbol thresholds |
 
 ## Files
 
-- `price_screener_binance.py` - Crypto screener (Lighter + Hyperliquid vs Binance)
-- `price_screener_rwa.py` - RWA screener (stocks, commodities, forex)
-- `price_screener_qfex.py` - QFEX screener (trades vs underlier price)
+- `price_screener.py` - Unified screener: all Lighter + Hyperliquid markets (crypto + RWA)
+- `price_screener_qfex.py` - QFEX screener (trades vs underlier price, websocket-based)
+- `price_screener_binance.py` - LEGACY crypto screener (replaced by price_screener.py)
+- `price_screener_rwa.py` - LEGACY RWA screener (replaced by price_screener.py)
 - `config.json` - Blacklist and custom thresholds
 - `requirements.txt` - Python dependencies
 - `.env` - Environment configuration
@@ -106,12 +108,14 @@ All settings except Telegram credentials:
 
 **Linux/Mac:**
 ```bash
-nohup python price_screener_binance.py > screener.log 2>&1 &
+nohup python price_screener.py > screener.log 2>&1 &
+nohup python price_screener_qfex.py > screener_qfex.log 2>&1 &
 ```
 
 **Windows (Task Scheduler):**
 ```bash
-pythonw price_screener_binance.py
+pythonw price_screener.py
+pythonw price_screener_qfex.py
 ```
 
 ## License

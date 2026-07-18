@@ -1,6 +1,10 @@
 {
     "default_threshold": 4.0,
-    "poll_interval": 1,
+    "poll_interval": 3,
+    "poll_interval_lighter": 1.5,
+    "poll_interval_hyperliquid": 2.5,
+    "poll_interval_qfex": 1,
+    "min_volume_lighter": 10000,
     "symbol_blacklist": [
         "AI", "AI16Z", "AIXBT", "BNT", "FTM", "OMNI", "ORBS",
         "STRAX", "RDNT", "STG", "PIXEL", "NTRN"

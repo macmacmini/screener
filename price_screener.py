@@ -1,16 +1,21 @@
 """
-Real World Assets (RWA) Price Screener
-Monitors Lighter.xyz RWA markets against Lighter's own index price (oracle)
-and Hyperliquid xyz RWA markets against Hyperliquid's oracle
-Sends Telegram alerts when deviation exceeds configured threshold
+Unified Price Screener
+Monitors all Lighter.xyz and Hyperliquid markets (crypto + RWA) in one process.
+Each exchange is compared against its own reference price:
+- Lighter: last trade price vs Lighter's own index price (all active markets, 1 bulk call)
+- Hyperliquid main dex: bid/ask (impactPxs) vs Hyperliquid's own oracle (1 call)
+- Hyperliquid xyz dex (RWA): bid/ask (impactPxs) vs Hyperliquid's own oracle (1 call)
+Sends Telegram alerts when deviation exceeds configured threshold.
+
+QFEX runs separately (price_screener_qfex.py) as it is websocket-based.
+Replaces price_screener_binance.py and price_screener_rwa.py.
 """
 
 import asyncio
 import os
 import json
 import logging
-from datetime import datetime
-from typing import Dict, Optional, Set
+from typing import Dict
 from dotenv import load_dotenv
 import lighter
 import requests
@@ -26,19 +31,6 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-# Lighter strategy_index -> asset class. RWA markets are compared against
-# Lighter's own index_price, so no cross-exchange symbol mapping is needed.
-# 2 = crypto (covered by the Binance screener), 0 = inactive/delisted
-RWA_STRATEGY_INDEXES = {
-    3,  # commodities (XAU, XAG, WTI, NATGAS, ...)
-    4,  # forex (EURUSD, USDJPY, ...)
-    5,  # US equities & ETFs (TSLA, NVDA, SPY, ...)
-    6,  # Asian equities (SAMSUNGUSD, TENCENT, ...)
-    7,  # pre-IPO (SPCX, OPENAI, ANTHROPIC, ...)
-}
-
 
 
 # Load config from JSON file
@@ -63,13 +55,32 @@ CONFIG = load_config()
 SYMBOL_BLACKLIST = set(CONFIG.get('symbol_blacklist', []))
 CUSTOM_THRESHOLDS = CONFIG.get('custom_thresholds', {})
 
+HYPERLIQUID_INFO_URL = "https://api.hyperliquid.xyz/info"
 
-class RWAPriceScreener:
-    """Monitor RWA markets: Lighter.xyz vs its own index price, Hyperliquid xyz vs its own oracle"""
+# Minimum 24h volume (USD) per Hyperliquid dex - markets below are skipped
+HL_MIN_VOLUME = {
+    None: 150000,   # main dex (crypto)
+    'xyz': 50000,   # xyz dex (RWA)
+}
+
+# Minimum 24h volume (USD) for Lighter markets - filters out dead/illiquid
+# markets whose last trade price is stale and far from index
+LIGHTER_MIN_VOLUME = float(CONFIG.get('min_volume_lighter', 0))
+
+
+class UnifiedPriceScreener:
+    """Monitor all Lighter and Hyperliquid markets, each vs its own index/oracle price"""
 
     def __init__(self):
         self.deviation_threshold = float(CONFIG.get('default_threshold', 0.5))
-        self.poll_interval = int(CONFIG.get('poll_interval', 60))
+
+        # Per-exchange poll intervals, tuned to stay under rate limits:
+        # - Lighter: 60 req/min per IP -> 1.5s = 40/min (67%), headroom for validation calls
+        # - Hyperliquid: 1200 weight/min per IP, 2 calls x 20 weight per round
+        #   -> 2.5s = 24 rounds = 960 weight/min (80%)
+        fallback = float(CONFIG.get('poll_interval', 60))
+        self.poll_interval_lighter = float(CONFIG.get('poll_interval_lighter', fallback))
+        self.poll_interval_hl = float(CONFIG.get('poll_interval_hyperliquid', fallback))
 
         # Telegram configuration
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -86,20 +97,19 @@ class RWAPriceScreener:
         self.last_alert: Dict[str, float] = {}
         self.alert_cooldown = 300  # 5 minutes between alerts for same pair
 
-        # Track consecutive alerts for blacklisting
+        # Track consecutive alerts for auto-blacklisting
         self.consecutive_alerts: Dict[str, int] = {}
         self.blacklisted: Dict[str, float] = {}  # market_key -> blacklist timestamp
         self.blacklist_duration = 86400  # 24 hours in seconds
 
-        # 2-poll confirmation: alert only if deviation persists across consecutive scans
-        self.pending_alerts: Dict[str, str] = {}  # alert_key -> message from previous scan
+        # 2-poll confirmation: alert only if deviation persists across consecutive scans.
+        # Separate pending dicts per exchange loop so confirmation always compares fresh data
+        self.pending_lighter: Dict[str, str] = {}  # alert_key -> message from previous scan
+        self.pending_hl: Dict[str, str] = {}
 
         # Lighter API client
         self.client = lighter.ApiClient()
         self.order_api = lighter.OrderApi(self.client)
-
-        # Symbol -> market_id mapping for recent_trades validation
-        self.symbol_to_market_id: Dict[str, int] = {}
 
     async def send_alert(self, market_key: str, message: str):
         """Send alert via Telegram and/or console"""
@@ -163,7 +173,7 @@ class RWAPriceScreener:
         # Send to Telegram
         if self.bot:
             try:
-                formatted_message = f"🚨 *RWA Price Alert*\n\n{message}"
+                formatted_message = f"🚨 *Price Alert*\n\n{message}"
                 await self.bot.send_message(
                     chat_id=self.telegram_chat_id,
                     text=formatted_message,
@@ -174,9 +184,8 @@ class RWAPriceScreener:
             except TelegramError as e:
                 logger.error(f"Failed to send Telegram message: {e}")
 
-
-    async def fetch_lighter_rwa_prices(self) -> Dict[str, dict]:
-        """Fetch all RWA markets from Lighter.xyz in one bulk call.
+    async def fetch_lighter_prices(self) -> Dict[str, dict]:
+        """Fetch ALL active Lighter markets (crypto + RWA) in one bulk call.
         order_book_details includes Lighter's own index_price (oracle),
         so each market carries its own reference price."""
         try:
@@ -197,14 +206,18 @@ class RWAPriceScreener:
 
                 if d.get('status') != 'active':
                     continue
-                if d.get('strategy_index') not in RWA_STRATEGY_INDEXES:
-                    continue
 
                 symbol = d.get('symbol')
                 last_price = d.get('last_trade_price')
                 index_price = d.get('index_price')
 
                 if not symbol or not last_price or not index_price:
+                    continue
+
+                # Skip markets with low volume
+                volume_usd = float(d.get('daily_quote_token_volume') or 0)
+                if volume_usd < LIGHTER_MIN_VOLUME:
+                    logger.debug(f"Skipping {symbol}: volume ${volume_usd:.0f} < ${LIGHTER_MIN_VOLUME:.0f}")
                     continue
 
                 try:
@@ -222,70 +235,37 @@ class RWAPriceScreener:
                     'trades_count': d.get('daily_trades_count', 0)
                 }
 
-            logger.info(f"Fetched prices for {len(prices)} Lighter RWA markets")
+            logger.info(f"Fetched prices for {len(prices)} Lighter markets (bulk)")
             return prices
 
         except Exception as e:
-            logger.error(f"Error fetching Lighter RWA prices: {e}")
+            logger.error(f"Error fetching Lighter prices (bulk): {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {}
 
-    async def validate_lighter_price(self, symbol: str, expected_price: float) -> bool:
-        """Validate Lighter last_trade_price by checking recent_trades endpoint.
-        Returns True if price is confirmed, False if it looks wrong."""
-        market_id = self.symbol_to_market_id.get(symbol)
-        if market_id is None:
-            logger.warning(f"No market_id for {symbol}, blocking alert (can't validate)")
-            return False
-
+    def fetch_hyperliquid_prices(self, dex: str = None) -> Dict[str, dict]:
+        """Fetch all markets from a Hyperliquid dex in one call.
+        dex=None -> main dex (crypto), dex='xyz' -> xyz dex (RWA).
+        Response includes Hyperliquid's own oracle price per market."""
+        dex_label = dex or 'main'
         try:
-            trades = await self.order_api.recent_trades(market_id=market_id, limit=5)
-            if not hasattr(trades, 'trades') or not trades.trades:
-                logger.warning(f"No recent trades for {symbol}, blocking alert")
-                return False
+            data = {"type": "metaAndAssetCtxs"}
+            if dex:
+                data["dex"] = dex
 
-            latest_trade = trades.trades[0]
-            if isinstance(latest_trade, dict):
-                real_price = float(latest_trade.get('price', 0))
-            else:
-                real_price = float(getattr(latest_trade, 'price', 0))
-
-            if real_price <= 0:
-                return False
-
-            diff_pct = abs(expected_price - real_price) / real_price * 100
-            if diff_pct > 1.0:
-                logger.warning(
-                    f"REJECTED {symbol}: exchange_stats=${expected_price:.6f} vs "
-                    f"recent_trades=${real_price:.6f} (diff {diff_pct:.2f}%) - stale data"
-                )
-                return False
-
-            logger.info(f"VALIDATED {symbol}: exchange_stats=${expected_price:.6f} matches recent_trades=${real_price:.6f}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error validating {symbol} price: {e}")
-            return False
-
-    def fetch_hyperliquid_xyz_prices(self) -> Dict[str, dict]:
-        """Fetch RWA prices from Hyperliquid xyz (HIP-3)"""
-        try:
-            url = "https://api.hyperliquid.xyz/info"
-            data = {"type": "metaAndAssetCtxs", "dex": "xyz"}
-
-            response = requests.post(url, json=data, timeout=10)
+            response = requests.post(HYPERLIQUID_INFO_URL, json=data, timeout=10)
             response.raise_for_status()
 
             meta_data = response.json()
 
             if not isinstance(meta_data, list) or len(meta_data) < 2:
-                logger.error("Unexpected metaAndAssetCtxs response format")
+                logger.error(f"Unexpected metaAndAssetCtxs response format (dex={dex_label})")
                 return {}
 
             universe = meta_data[0].get('universe', [])
             contexts = meta_data[1]
+            min_volume = HL_MIN_VOLUME.get(dex, 50000)
 
             prices = {}
             for i, market in enumerate(universe):
@@ -304,13 +284,13 @@ class RWAPriceScreener:
                 impact_pxs = ctx.get('impactPxs')
                 day_volume = ctx.get('dayNtlVlm')
 
-                if not oracle_px or not impact_pxs or len(impact_pxs) != 2:
+                if not symbol or not oracle_px or not impact_pxs or len(impact_pxs) != 2:
                     continue
 
-                # Skip markets with very low volume (< $50k in 24h)
+                # Skip markets with low volume
                 volume_usd = float(day_volume) if day_volume is not None else 0
-                if volume_usd < 50000:
-                    logger.debug(f"Skipping {symbol}: volume ${volume_usd:.0f} < $50k")
+                if volume_usd < min_volume:
+                    logger.debug(f"Skipping {symbol}: volume ${volume_usd:.0f} < ${min_volume}")
                     continue
 
                 try:
@@ -323,20 +303,20 @@ class RWAPriceScreener:
                 except (ValueError, TypeError):
                     continue
 
-            logger.info(f"Fetched prices for {len(prices)} Hyperliquid xyz RWA markets")
+            logger.info(f"Fetched prices for {len(prices)} Hyperliquid {dex_label} markets")
             return prices
 
         except Exception as e:
-            logger.error(f"Error fetching Hyperliquid xyz prices: {e}")
+            logger.error(f"Error fetching Hyperliquid {dex_label} prices: {e}")
             import traceback
             logger.error(traceback.format_exc())
             return {}
 
-    def calculate_deviation(self, price: float, oracle_price: float) -> float:
-        """Calculate percentage deviation from oracle price"""
-        if oracle_price == 0:
+    def calculate_deviation(self, price: float, reference_price: float) -> float:
+        """Calculate percentage deviation from reference (index/oracle) price"""
+        if reference_price == 0:
             return 0.0
-        return ((price - oracle_price) / oracle_price) * 100
+        return ((price - reference_price) / reference_price) * 100
 
     def check_lighter_market(self, symbol: str, lighter_data: dict):
         """Check a single Lighter market: last trade price vs Lighter's own index price"""
@@ -384,8 +364,8 @@ class RWAPriceScreener:
             logger.error(f"Error checking Lighter market {symbol}: {e}")
             return None
 
-    def check_hyperliquid_xyz_market(self, symbol: str, hl_data: dict):
-        """Check a single Hyperliquid xyz market for bid/ask deviation from oracle"""
+    def check_hyperliquid_market(self, symbol: str, hl_data: dict, dex: str = None):
+        """Check a single Hyperliquid market: bid/ask vs Hyperliquid's own oracle price"""
         try:
             # Skip blacklisted symbols
             if symbol in SYMBOL_BLACKLIST:
@@ -403,14 +383,17 @@ class RWAPriceScreener:
             bid_deviation = self.calculate_deviation(best_bid, oracle_price)
             ask_deviation = self.calculate_deviation(best_ask, oracle_price)
 
+            dex_tag = f"HL-{dex}" if dex else "HL"
+            trade_symbol = f"{dex}:{symbol}" if dex else symbol
+
             logger.debug(
-                f"HL xyz {symbol}: Bid=${best_bid:.4f} ({bid_deviation:.2f}%), "
+                f"{dex_tag} {symbol}: Bid=${best_bid:.4f} ({bid_deviation:.2f}%), "
                 f"Ask=${best_ask:.4f} ({ask_deviation:.2f}%), "
                 f"Oracle=${oracle_price:.4f}"
             )
 
-            bid_key = f"HL-xyz-{symbol}-BID"
-            ask_key = f"HL-xyz-{symbol}-ASK"
+            bid_key = f"{dex_tag}-{symbol}-BID"
+            ask_key = f"{dex_tag}-{symbol}-ASK"
             alerts = []
 
             # Get threshold (custom or default)
@@ -421,12 +404,12 @@ class RWAPriceScreener:
                 direction = "↑" if bid_deviation > 0 else "↓"
                 emoji = "📈" if bid_deviation > 0 else "📉"
                 message = (
-                    f"{emoji} *HYPERLIQUID xyz - {symbol} (SELL)*\n"
+                    f"{emoji} *HYPERLIQUID {dex or 'main'} - {symbol} (SELL)*\n"
                     f"Best Bid: `${best_bid:.4f}`\n"
                     f"Oracle: `${oracle_price:.4f}`\n"
                     f"Deviation: *{direction}{abs(bid_deviation):.2f}%*\n"
                     f"Threshold: {threshold}%\n"
-                    f"🔗 https://app.hyperliquid.xyz/trade/xyz:{symbol}"
+                    f"🔗 https://app.hyperliquid.xyz/trade/{trade_symbol}"
                 )
                 alerts.append((bid_key, message))
 
@@ -435,135 +418,127 @@ class RWAPriceScreener:
                 direction = "↑" if ask_deviation > 0 else "↓"
                 emoji = "📈" if ask_deviation > 0 else "📉"
                 message = (
-                    f"{emoji} *HYPERLIQUID xyz - {symbol} (BUY)*\n"
+                    f"{emoji} *HYPERLIQUID {dex or 'main'} - {symbol} (BUY)*\n"
                     f"Best Ask: `${best_ask:.4f}`\n"
                     f"Oracle: `${oracle_price:.4f}`\n"
                     f"Deviation: *{direction}{abs(ask_deviation):.2f}%*\n"
                     f"Threshold: {threshold}%\n"
-                    f"🔗 https://app.hyperliquid.xyz/trade/xyz:{symbol}"
+                    f"🔗 https://app.hyperliquid.xyz/trade/{trade_symbol}"
                 )
                 alerts.append((ask_key, message))
 
             return alerts if alerts else None
 
         except Exception as e:
-            logger.error(f"Error checking Hyperliquid xyz market {symbol}: {e}")
+            logger.error(f"Error checking Hyperliquid market {symbol}: {e}")
             return None
 
-    async def scan_all_markets(self):
-        """Scan all RWA markets: Lighter vs its own index price, Hyperliquid xyz vs its own oracle"""
-        # Fetch Hyperliquid xyz prices (includes oracle prices)
-        hyperliquid_prices = self.fetch_hyperliquid_xyz_prices()
+    async def scan_lighter_markets(self):
+        """Scan all Lighter markets vs Lighter's own index price (1 API call)"""
+        lighter_prices = await self.fetch_lighter_prices()
 
-        # Fetch Lighter prices (includes Lighter's own index price)
-        lighter_prices = await self.fetch_lighter_rwa_prices()
-
-        if not lighter_prices and not hyperliquid_prices:
-            logger.warning("No prices available from either exchange, skipping scan")
+        if not lighter_prices:
+            logger.warning("No Lighter prices available, skipping scan")
             return
 
-        logger.info(
-            f"Scanning {len(lighter_prices)} Lighter + {len(hyperliquid_prices)} Hyperliquid xyz markets..."
-        )
-
         alerts = []
-
-        # Check Lighter markets against Lighter's own index price
         for symbol, lighter_data in lighter_prices.items():
             result = self.check_lighter_market(symbol, lighter_data)
             if result:
                 alerts.append(result)
 
-        # Check Hyperliquid xyz markets (uses Hyperliquid's own oracle)
-        for symbol, hl_data in hyperliquid_prices.items():
-            result = self.check_hyperliquid_xyz_market(symbol, hl_data)
+        # 2-poll confirmation: only send alerts that were also detected in the previous scan
+        current_alerts = {key: message for key, message in alerts}
+        confirmed = []
+        for alert_key, message in current_alerts.items():
+            if alert_key in self.pending_lighter:
+                confirmed.append((alert_key, message))
+            else:
+                logger.info(f"Pending confirmation: {alert_key} (will alert if persists next scan)")
+
+        for alert_key, message in confirmed:
+            await self.send_alert(alert_key, message)
+
+        self.pending_lighter = current_alerts
+
+        if confirmed:
+            logger.info(f"Lighter scan: {len(confirmed)} alerts sent ({len(current_alerts)} detected, {len(lighter_prices)} markets)")
+        elif current_alerts:
+            logger.info(f"Lighter scan: {len(current_alerts)} pending confirmation ({len(lighter_prices)} markets)")
+
+    async def scan_hyperliquid_markets(self):
+        """Scan Hyperliquid main + xyz markets vs Hyperliquid's own oracle (2 API calls)"""
+        # requests is blocking - run in a thread so the Lighter loop isn't stalled
+        hl_main_prices = await asyncio.to_thread(self.fetch_hyperliquid_prices)
+        hl_xyz_prices = await asyncio.to_thread(self.fetch_hyperliquid_prices, 'xyz')
+
+        if not hl_main_prices and not hl_xyz_prices:
+            logger.warning("No Hyperliquid prices available, skipping scan")
+            return
+
+        alerts = []
+        for symbol, hl_data in hl_main_prices.items():
+            result = self.check_hyperliquid_market(symbol, hl_data)
             if result:
-                # Result is a list of alerts
+                alerts.extend(result)
+
+        for symbol, hl_data in hl_xyz_prices.items():
+            result = self.check_hyperliquid_market(symbol, hl_data, dex='xyz')
+            if result:
                 alerts.extend(result)
 
         # 2-poll confirmation: only send alerts that were also detected in the previous scan
         current_alerts = {key: message for key, message in alerts}
         confirmed = []
         for alert_key, message in current_alerts.items():
-            if alert_key in self.pending_alerts:
+            if alert_key in self.pending_hl:
                 confirmed.append((alert_key, message))
             else:
                 logger.info(f"Pending confirmation: {alert_key} (will alert if persists next scan)")
 
-        # Validate confirmed Lighter alerts with recent_trades before sending
-        validated = []
         for alert_key, message in confirmed:
-            if alert_key.startswith("LT-"):
-                symbol = alert_key[3:]  # "LT-MSTR" -> "MSTR"
-                price = lighter_prices.get(symbol, {}).get('last_trade_price')
-                if price and not await self.validate_lighter_price(symbol, price):
-                    continue  # rejected by recent_trades validation
-            validated.append((alert_key, message))
-
-        # Send only validated alerts
-        for alert_key, message in validated:
             await self.send_alert(alert_key, message)
 
-        # Update pending for next scan
-        self.pending_alerts = current_alerts
+        self.pending_hl = current_alerts
 
-        if validated:
-            logger.info(f"Scan complete - {len(validated)} validated alerts sent ({len(current_alerts)} detected)")
+        if confirmed:
+            logger.info(f"HL scan: {len(confirmed)} alerts sent ({len(current_alerts)} detected, "
+                        f"{len(hl_main_prices)}+{len(hl_xyz_prices)} markets)")
         elif current_alerts:
-            logger.info(f"Scan complete - {len(current_alerts)} pending confirmation, 0 sent")
-        else:
-            logger.info("Scan complete - no deviations detected")
+            logger.info(f"HL scan: {len(current_alerts)} pending confirmation "
+                        f"({len(hl_main_prices)}+{len(hl_xyz_prices)} markets)")
 
-    async def _build_market_id_mapping(self):
-        """Fetch order_books once to build symbol -> market_id mapping for recent_trades validation"""
-        try:
-            orderbooks_response = await self.order_api.order_books()
-            if hasattr(orderbooks_response, 'order_books'):
-                obs = orderbooks_response.order_books
-            elif hasattr(orderbooks_response, 'data'):
-                obs = orderbooks_response.data
-            else:
-                obs = orderbooks_response
+    async def _scan_loop(self, name: str, interval: float, scan_fn):
+        """Run one exchange's scan function on its own interval.
+        Scan duration is subtracted from the sleep so the interval holds
+        the actual API call rate, not interval + scan time."""
+        loop = asyncio.get_event_loop()
+        while True:
+            started = loop.time()
+            try:
+                await scan_fn()
+            except Exception as e:
+                logger.error(f"Error during {name} scan: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
 
-            if isinstance(obs, list):
-                for ob in obs:
-                    if isinstance(ob, dict):
-                        symbol = ob.get('symbol', '')
-                        market_id = ob.get('market_id')
-                    else:
-                        symbol = getattr(ob, 'symbol', '')
-                        market_id = getattr(ob, 'market_id', None)
-                    if symbol and market_id is not None:
-                        self.symbol_to_market_id[symbol] = int(market_id)
-
-            logger.info(f"Built market_id mapping for {len(self.symbol_to_market_id)} symbols")
-        except Exception as e:
-            logger.error(f"Error building market_id mapping: {e}")
+            elapsed = loop.time() - started
+            await asyncio.sleep(max(0.1, interval - elapsed))
 
     async def run(self):
-        """Main loop - continuously monitor markets"""
-        logger.info(f"Starting RWA Price Screener")
-        logger.info(f"Monitoring: Lighter.xyz + Hyperliquid xyz")
-        logger.info(f"Reference: Lighter index price / Hyperliquid oracle (each vs its own)")
+        """Run both exchange loops concurrently, each at its own poll interval"""
+        logger.info(f"Starting Unified Price Screener")
+        logger.info(f"Monitoring: Lighter.xyz (all markets) + Hyperliquid main + Hyperliquid xyz")
+        logger.info(f"Reference: each exchange's own index/oracle price")
         logger.info(f"Deviation threshold: {self.deviation_threshold}%")
-        logger.info(f"Poll interval: {self.poll_interval} seconds")
-
-        # Build symbol -> market_id mapping once at startup
-        await self._build_market_id_mapping()
+        logger.info(f"Poll intervals: Lighter {self.poll_interval_lighter}s, "
+                    f"Hyperliquid {self.poll_interval_hl}s")
 
         try:
-            # Continuous monitoring loop
-            while True:
-                try:
-                    await self.scan_all_markets()
-                except Exception as e:
-                    logger.error(f"Error during scan: {e}")
-                    import traceback
-                    logger.error(traceback.format_exc())
-
-                # Wait before next scan
-                await asyncio.sleep(self.poll_interval)
-
+            await asyncio.gather(
+                self._scan_loop("Lighter", self.poll_interval_lighter, self.scan_lighter_markets),
+                self._scan_loop("Hyperliquid", self.poll_interval_hl, self.scan_hyperliquid_markets),
+            )
         except KeyboardInterrupt:
             logger.info("Shutting down...")
         finally:
@@ -576,7 +551,7 @@ class RWAPriceScreener:
 
 async def main():
     """Entry point"""
-    screener = RWAPriceScreener()
+    screener = UnifiedPriceScreener()
     try:
         await screener.run()
     finally:

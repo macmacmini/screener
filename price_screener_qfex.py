@@ -74,7 +74,9 @@ class QfexPriceScreener:
 
     def __init__(self):
         self.deviation_threshold = float(CONFIG.get('default_threshold', 0.5))
-        self.poll_interval = int(CONFIG.get('poll_interval', 60))
+        # QFEX scans read the websocket-fed in-memory cache (no REST calls),
+        # so it can poll faster than the REST-based screeners
+        self.poll_interval = int(CONFIG.get('poll_interval_qfex', CONFIG.get('poll_interval', 60)))
 
         # Telegram configuration
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
