@@ -15,6 +15,7 @@ import asyncio
 import os
 import json
 import logging
+import time
 from typing import Dict
 from dotenv import load_dotenv
 import lighter
@@ -110,6 +111,11 @@ class UnifiedPriceScreener:
         # Lighter API client
         self.client = lighter.ApiClient()
         self.order_api = lighter.OrderApi(self.client)
+
+        # When Hyperliquid rate-limits us (429), pause HL scans until this time.
+        # The 1200 weight/min IP quota is shared with everything else on this
+        # machine (e.g. app.hyperliquid.xyz open in a browser), so bursts happen
+        self.hl_backoff_until = 0.0
 
     async def send_alert(self, market_key: str, message: str):
         """Send alert via Telegram and/or console"""
@@ -255,6 +261,16 @@ class UnifiedPriceScreener:
                 data["dex"] = dex
 
             response = requests.post(HYPERLIQUID_INFO_URL, json=data, timeout=10)
+
+            if response.status_code == 429:
+                # Rate limited - back off for 60s instead of hammering harder
+                self.hl_backoff_until = time.time() + 60
+                logger.warning(
+                    f"Hyperliquid rate limit hit (429, dex={dex_label}) - pausing HL scans for 60s. "
+                    f"Note: the 1200 weight/min quota is per IP and shared with e.g. the HL web app in a browser"
+                )
+                return {}
+
             response.raise_for_status()
 
             meta_data = response.json()
@@ -399,29 +415,29 @@ class UnifiedPriceScreener:
             # Get threshold (custom or default)
             threshold = CUSTOM_THRESHOLDS.get(symbol, self.deviation_threshold)
 
-            # Alert if best bid deviates from oracle (sell opportunity)
-            if abs(bid_deviation) >= threshold:
-                direction = "↑" if bid_deviation > 0 else "↓"
-                emoji = "📈" if bid_deviation > 0 else "📉"
+            # Directional checks only: a wide spread (bid far below, ask far
+            # above) is a thin book, not an opportunity. The signal is the
+            # book crossing the oracle: bid too HIGH or ask too LOW.
+
+            # Bid above oracle -> someone bids too high -> sell opportunity
+            if bid_deviation >= threshold:
                 message = (
-                    f"{emoji} *HYPERLIQUID {dex or 'main'} - {symbol} (SELL)*\n"
+                    f"📈 *HYPERLIQUID {dex or 'main'} - {symbol} (SELL)*\n"
                     f"Best Bid: `${best_bid:.4f}`\n"
                     f"Oracle: `${oracle_price:.4f}`\n"
-                    f"Deviation: *{direction}{abs(bid_deviation):.2f}%*\n"
+                    f"Deviation: *↑{bid_deviation:.2f}%*\n"
                     f"Threshold: {threshold}%\n"
                     f"🔗 https://app.hyperliquid.xyz/trade/{trade_symbol}"
                 )
                 alerts.append((bid_key, message))
 
-            # Alert if best ask deviates from oracle (buy opportunity)
-            if abs(ask_deviation) >= threshold:
-                direction = "↑" if ask_deviation > 0 else "↓"
-                emoji = "📈" if ask_deviation > 0 else "📉"
+            # Ask below oracle -> someone offers too cheap -> buy opportunity
+            if ask_deviation <= -threshold:
                 message = (
-                    f"{emoji} *HYPERLIQUID {dex or 'main'} - {symbol} (BUY)*\n"
+                    f"📉 *HYPERLIQUID {dex or 'main'} - {symbol} (BUY)*\n"
                     f"Best Ask: `${best_ask:.4f}`\n"
                     f"Oracle: `${oracle_price:.4f}`\n"
-                    f"Deviation: *{direction}{abs(ask_deviation):.2f}%*\n"
+                    f"Deviation: *↓{abs(ask_deviation):.2f}%*\n"
                     f"Threshold: {threshold}%\n"
                     f"🔗 https://app.hyperliquid.xyz/trade/{trade_symbol}"
                 )
@@ -468,6 +484,11 @@ class UnifiedPriceScreener:
 
     async def scan_hyperliquid_markets(self):
         """Scan Hyperliquid main + xyz markets vs Hyperliquid's own oracle (2 API calls)"""
+        # Respect rate limit backoff after a 429
+        if time.time() < self.hl_backoff_until:
+            logger.debug("Hyperliquid backoff active, skipping scan")
+            return
+
         # requests is blocking - run in a thread so the Lighter loop isn't stalled
         hl_main_prices = await asyncio.to_thread(self.fetch_hyperliquid_prices)
         hl_xyz_prices = await asyncio.to_thread(self.fetch_hyperliquid_prices, 'xyz')

@@ -1,11 +1,16 @@
 """
 QFEX Price Screener
 Monitors QFEX perpetual markets (stocks, commodities, forex, indices)
-Compares executed trade prices against QFEX's own underlier (oracle) price
+Compares best bid/ask (order book top) against QFEX's own underlier (oracle) price
 Sends Telegram alerts when deviation exceeds configured threshold
 
+The order book comparison catches dislocations that happen without any trades
+(e.g. a market maker algo running the book far from the underlier), which on
+QFEX is the dominant failure mode - trade volume is thin and price spikes
+occur in the book alone.
+
 Prices arrive via QFEX public market data websocket (wss://mds.qfex.com):
-- 'trade' channel: executed trades per symbol
+- 'bbo' channel: best bid/ask per symbol (continuous stream)
 - 'underlier' channel: underlying asset reference price (~1s updates)
 A background task keeps the websocket connected and updates an in-memory
 cache; the scan loop reads the cache on the same poll/alert logic as the
@@ -36,7 +41,7 @@ logger = logging.getLogger(__name__)
 QFEX_WS_URL = "wss://mds.qfex.com"
 
 # Ignore cached prices older than this (websocket may go quiet unnoticed)
-TRADE_MAX_AGE = 120       # seconds - a trade older than this is no longer "current"
+BBO_MAX_AGE = 15          # seconds - active books stream bbo continuously; older = book gone quiet
 UNDERLIER_MAX_AGE = 30    # seconds - underlier updates ~1/s, so 30s means feed problems
 
 
@@ -70,7 +75,7 @@ def base_symbol(qfex_symbol: str) -> str:
 
 
 class QfexPriceScreener:
-    """Monitor QFEX markets: last trade price vs QFEX's own underlier price"""
+    """Monitor QFEX markets: best bid/ask vs QFEX's own underlier price"""
 
     def __init__(self):
         self.deviation_threshold = float(CONFIG.get('default_threshold', 0.5))
@@ -102,8 +107,8 @@ class QfexPriceScreener:
         self.pending_alerts: Dict[str, str] = {}  # alert_key -> message from previous scan
 
         # In-memory price cache updated by the websocket task
-        # symbol -> {'price': float, 'side': str, 'updated': float (time.time())}
-        self.last_trades: Dict[str, dict] = {}
+        # symbol -> {'bid': float, 'ask': float, 'updated': float (time.time())}
+        self.bbos: Dict[str, dict] = {}
         # symbol -> {'price': float, 'source': str, 'updated': float}
         self.underliers: Dict[str, dict] = {}
 
@@ -187,15 +192,20 @@ class QfexPriceScreener:
         msg_type = msg.get('type')
         symbol = msg.get('symbol')
 
-        if msg_type == 'trade' and symbol:
+        if msg_type == 'bbo' and symbol:
             try:
-                self.last_trades[symbol] = {
-                    'price': float(msg['price']),
-                    'side': msg.get('side', ''),
+                # bid/ask are arrays of [price, quantity] levels; top of book is [0]
+                bid_levels = msg.get('bid') or []
+                ask_levels = msg.get('ask') or []
+                if not bid_levels or not ask_levels:
+                    return  # one-sided book, can't compare
+                self.bbos[symbol] = {
+                    'bid': float(bid_levels[0][0]),
+                    'ask': float(ask_levels[0][0]),
                     'updated': time.time(),
                 }
-            except (KeyError, ValueError):
-                logger.debug(f"Malformed trade message: {msg}")
+            except (KeyError, ValueError, IndexError, TypeError):
+                logger.debug(f"Malformed bbo message: {msg}")
 
         elif msg_type == 'underlier' and symbol:
             try:
@@ -214,7 +224,7 @@ class QfexPriceScreener:
         """Keep the market data websocket connected, reconnect on failures"""
         subscribe_msg = json.dumps({
             "type": "subscribe",
-            "channels": ["trade", "underlier"],
+            "channels": ["bbo", "underlier"],
             "symbols": ["*"],
         })
 
@@ -240,13 +250,14 @@ class QfexPriceScreener:
             await asyncio.sleep(5)
 
     def calculate_deviation(self, price: float, underlier_price: float) -> float:
-        """Calculate percentage deviation of trade price from underlier price"""
+        """Calculate percentage deviation from underlier price"""
         if underlier_price == 0:
             return 0.0
         return ((price - underlier_price) / underlier_price) * 100
 
-    def check_qfex_market(self, symbol: str, trade_data: dict, underlier_data: dict):
-        """Check a single QFEX market: last trade price vs underlier price"""
+    def check_qfex_market(self, symbol: str, bbo_data: dict, underlier_data: dict):
+        """Check a single QFEX market: best bid/ask vs underlier price.
+        Catches order book dislocations even when no trades happen."""
         try:
             base = base_symbol(symbol)
 
@@ -258,69 +269,88 @@ class QfexPriceScreener:
             now = time.time()
 
             # Skip stale data - websocket may have gone quiet or market inactive
-            if now - trade_data['updated'] > TRADE_MAX_AGE:
+            if now - bbo_data['updated'] > BBO_MAX_AGE:
                 return None
             if now - underlier_data['updated'] > UNDERLIER_MAX_AGE:
                 logger.debug(f"Skipping {symbol}: underlier price stale")
                 return None
 
-            trade_price = trade_data['price']
+            best_bid = bbo_data['bid']
+            best_ask = bbo_data['ask']
             underlier_price = underlier_data['price']
             source = underlier_data['source']
 
-            deviation = self.calculate_deviation(trade_price, underlier_price)
+            bid_deviation = self.calculate_deviation(best_bid, underlier_price)
+            ask_deviation = self.calculate_deviation(best_ask, underlier_price)
 
             logger.debug(
-                f"QFEX {symbol}: Trade=${trade_price:.4f}, Underlier=${underlier_price:.4f} "
-                f"({source}), Deviation={deviation:.2f}%"
+                f"QFEX {symbol}: Bid={best_bid:.4f} ({bid_deviation:.2f}%), "
+                f"Ask={best_ask:.4f} ({ask_deviation:.2f}%), "
+                f"Underlier={underlier_price:.4f} ({source})"
             )
-
-            market_key = f"QF-{symbol}"
 
             # Get threshold (custom or default)
             threshold = CUSTOM_THRESHOLDS.get(base, self.deviation_threshold)
 
-            # Alert if deviation exceeds threshold
-            if abs(deviation) >= threshold:
-                direction = "↑" if deviation > 0 else "↓"
-                emoji = "📈" if deviation > 0 else "📉"
+            alerts = []
 
+            # Directional checks only: a wide spread (bid far below, ask far
+            # above) is an empty book, not an opportunity. The signal is the
+            # book crossing the underlier: bid too HIGH or ask too LOW.
+
+            # Bid above underlier -> someone bids too high -> sell opportunity
+            if bid_deviation >= threshold:
                 message = (
-                    f"{emoji} *QFEX - {symbol}*\n"
-                    f"Last Trade: `${trade_price:.4f}` ({trade_data['side']})\n"
-                    f"Underlier: `${underlier_price:.4f}` ({source})\n"
-                    f"Deviation: *{direction}{abs(deviation):.2f}%*\n"
+                    f"📈 *QFEX - {symbol} (SELL)*\n"
+                    f"Best Bid: `{best_bid:.4f}`\n"
+                    f"Underlier: `{underlier_price:.4f}` ({source})\n"
+                    f"Deviation: *↑{bid_deviation:.2f}%*\n"
                     f"Threshold: {threshold}%\n"
                     f"🔗 https://qfex.com/trade/{symbol}"
                 )
-                return (market_key, message)
-            return None
+                alerts.append((f"QF-{symbol}-BID", message))
+
+            # Ask below underlier -> someone offers too cheap -> buy opportunity
+            if ask_deviation <= -threshold:
+                message = (
+                    f"📉 *QFEX - {symbol} (BUY)*\n"
+                    f"Best Ask: `{best_ask:.4f}`\n"
+                    f"Underlier: `{underlier_price:.4f}` ({source})\n"
+                    f"Deviation: *↓{abs(ask_deviation):.2f}%*\n"
+                    f"Threshold: {threshold}%\n"
+                    f"🔗 https://qfex.com/trade/{symbol}"
+                )
+                alerts.append((f"QF-{symbol}-ASK", message))
+
+            return alerts if alerts else None
 
         except Exception as e:
             logger.error(f"Error checking QFEX market {symbol}: {e}")
             return None
 
     async def scan_all_markets(self):
-        """Scan all cached QFEX markets for trade price vs underlier deviations"""
-        if not self.ws_connected and not self.last_trades:
+        """Scan all cached QFEX markets for bid/ask vs underlier deviations"""
+        if not self.ws_connected and not self.bbos:
             logger.warning("QFEX websocket not connected yet, skipping scan")
             return
 
         alerts = []
         scanned = 0
+        now = time.time()
 
-        for symbol, trade_data in self.last_trades.items():
+        for symbol, bbo_data in self.bbos.items():
             underlier_data = self.underliers.get(symbol)
             if not underlier_data:
                 logger.debug(f"No underlier price for {symbol}")
                 continue
 
-            scanned += 1
-            result = self.check_qfex_market(symbol, trade_data, underlier_data)
+            if now - bbo_data['updated'] <= BBO_MAX_AGE:
+                scanned += 1
+            result = self.check_qfex_market(symbol, bbo_data, underlier_data)
             if result:
-                alerts.append(result)
+                alerts.extend(result)
 
-        logger.info(f"Scanned {scanned} QFEX markets with recent trades...")
+        logger.info(f"Scanned {scanned} QFEX markets with live order books")
 
         # 2-poll confirmation: only send alerts that were also detected in the previous scan
         current_alerts = {key: message for key, message in alerts}
@@ -348,7 +378,7 @@ class QfexPriceScreener:
     async def run(self):
         """Main loop - websocket in background, scan cache on poll interval"""
         logger.info(f"Starting QFEX Price Screener")
-        logger.info(f"Monitoring: QFEX perpetual markets (trades vs underlier)")
+        logger.info(f"Monitoring: QFEX perpetual markets (bid/ask vs underlier)")
         logger.info(f"Deviation threshold: {self.deviation_threshold}%")
         logger.info(f"Poll interval: {self.poll_interval} seconds")
 

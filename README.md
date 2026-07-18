@@ -22,7 +22,8 @@ python price_screener.py
 Monitors QFEX perpetual markets (stocks, commodities, forex, indices) via public websocket.
 
 - Monitors all ~138 QFEX markets (NVDA, TSLA, GOLD, EUR-USD, US500, etc.)
-- Compares executed trade prices vs QFEX's own underlier (oracle) price
+- Compares best bid/ask vs QFEX's own underlier (oracle) price - catches order
+  book dislocations even with zero trade volume (the dominant QFEX failure mode)
 - Underlier source shown in alerts: `external` (market hours) / `internal` (order-book derived, off hours)
 - Websocket feed (wss://mds.qfex.com), no API key needed; stale prices are skipped
 
@@ -93,7 +94,7 @@ All settings except Telegram credentials:
 ## Files
 
 - `price_screener.py` - Unified screener: all Lighter + Hyperliquid markets (crypto + RWA)
-- `price_screener_qfex.py` - QFEX screener (trades vs underlier price, websocket-based)
+- `price_screener_qfex.py` - QFEX screener (bid/ask vs underlier price, websocket-based)
 - `config.json` - Blacklist and custom thresholds
 - `requirements.txt` - Python dependencies
 - `.env` - Environment configuration
