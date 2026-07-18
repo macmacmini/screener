@@ -1,6 +1,5 @@
 {
     "default_threshold": 4.0,
-    "poll_interval": 3,
     "poll_interval_lighter": 1.5,
     "poll_interval_hyperliquid": 2.5,
     "poll_interval_qfex": 1,

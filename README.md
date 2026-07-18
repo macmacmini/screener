@@ -18,9 +18,6 @@ symbol mapping needed.
 python price_screener.py
 ```
 
-Replaces the legacy `price_screener_binance.py` and `price_screener_rwa.py`
-(kept in the repo for reference until the unified screener is proven in use).
-
 ### 2. QFEX Screener (`price_screener_qfex.py`)
 Monitors QFEX perpetual markets (stocks, commodities, forex, indices) via public websocket.
 
@@ -71,10 +68,10 @@ All settings except Telegram credentials:
 ```json
 {
   "default_threshold": 4.0,
-  "poll_interval": 3,
   "poll_interval_lighter": 1.5,
   "poll_interval_hyperliquid": 2.5,
   "poll_interval_qfex": 1,
+  "min_volume_lighter": 10000,
   "symbol_blacklist": ["SYMBOL1", "SYMBOL2"],
   "custom_thresholds": {
     "BTC": 0.3,
@@ -89,7 +86,6 @@ All settings except Telegram credentials:
 | `poll_interval_lighter` | 1.5 | Seconds between Lighter scans. Limit: 60 req/min per IP; 1.5s = 40/min (67%), leaving headroom for recent_trades validation calls |
 | `poll_interval_hyperliquid` | 2.5 | Seconds between Hyperliquid scans (main + xyz = 2 calls x 20 weight). Limit: 1200 weight/min per IP; 2.5s = 960/min (80%) |
 | `poll_interval_qfex` | 1 | Seconds between QFEX scans (websocket-fed, no REST calls, safe to keep at 1) |
-| `poll_interval` | 3 | Fallback for the above + used by the legacy screeners |
 | `min_volume_lighter` | 10000 | Minimum 24h USD volume for Lighter markets; filters out dead markets whose stale last trade sits far from index (Hyperliquid equivalents are hardcoded: 150k main / 50k xyz) |
 | `symbol_blacklist` | [] | Symbols to ignore |
 | `custom_thresholds` | {} | Per-symbol thresholds |
@@ -98,8 +94,6 @@ All settings except Telegram credentials:
 
 - `price_screener.py` - Unified screener: all Lighter + Hyperliquid markets (crypto + RWA)
 - `price_screener_qfex.py` - QFEX screener (trades vs underlier price, websocket-based)
-- `price_screener_binance.py` - LEGACY crypto screener (replaced by price_screener.py)
-- `price_screener_rwa.py` - LEGACY RWA screener (replaced by price_screener.py)
 - `config.json` - Blacklist and custom thresholds
 - `requirements.txt` - Python dependencies
 - `.env` - Environment configuration

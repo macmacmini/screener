@@ -48,7 +48,7 @@ def load_config() -> dict:
         with open(config_path, 'r') as f:
             config = json.load(f)
         logger.info(f"Loaded config: threshold={config.get('default_threshold', 0.5)}%, "
-                   f"poll={config.get('poll_interval', 60)}s, "
+                   f"poll={config.get('poll_interval_qfex', 60)}s, "
                    f"{len(config.get('symbol_blacklist', []))} blacklisted")
         return config
     except FileNotFoundError:
